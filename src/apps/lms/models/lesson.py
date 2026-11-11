@@ -1,0 +1,99 @@
+from django.apps import apps
+from django.db.models import Index, Q, QuerySet
+from django.utils import timezone
+from django.utils.translation import gettext_lazy as _
+from django.utils.translation import pgettext_lazy
+
+from apps.users.models import User
+from core.models import TimestampedModel, models
+
+
+class LessonQuerySet(QuerySet):
+    def for_viewset(self) -> "LessonQuerySet":
+        return self.select_related(
+            "question",
+            "material",
+        ).order_by(
+            "position",
+        )
+
+    def exclude_not_opened(self) -> "LessonQuerySet":
+        return self.filter(
+            hidden=False,
+        ).filter(
+            Q(module__start_date__isnull=True) | Q(module__start_date__lte=timezone.now()),
+        )
+
+    def for_user(self, user: User) -> "LessonQuerySet":
+        purchased_courses = apps.get_model("products.Course").objects.for_user(user).values_list("id", flat=True)
+        return self.filter(
+            module__course__in=purchased_courses,
+        )
+
+    def for_user_including_neighbour_courses(self, user: User) -> "LessonQuerySet":
+        """The same as above, but with all courses belonging to the same product groups that user has puchased"""
+        purchased_courses = apps.get_model("products.Course").objects.for_user(user).values_list("id", flat=True)
+        purchased_groups = apps.get_model("products.Course").objects.filter(pk__in=purchased_courses).values("group_id").distinct()
+
+        return self.filter(
+            module__course__group__in=purchased_groups,
+        )
+
+    def for_admin(self) -> "LessonQuerySet":
+        return self.select_related(
+            "module",
+            "module__course",
+            "module__course__group",
+            "material",
+            "call",
+        )
+
+
+class Lesson(TimestampedModel):
+    objects = LessonQuerySet.as_manager()
+
+    module = models.ForeignKey("lms.Module", on_delete=models.CASCADE, verbose_name=_("Module"))
+    position = models.PositiveIntegerField(default=0, blank=False, null=False, db_index=True)
+    material = models.ForeignKey("notion.Material", blank=True, null=True, on_delete=models.PROTECT, verbose_name=pgettext_lazy("lessons", "Material"))
+    question = models.ForeignKey(to="homework.Question", blank=True, null=True, on_delete=models.PROTECT, verbose_name=pgettext_lazy("lms", "Question"))
+
+    call = models.ForeignKey("lms.Call", blank=True, null=True, on_delete=models.CASCADE, verbose_name=pgettext_lazy("lms", "Call"))
+    hidden = models.BooleanField(_("Hidden"), help_text=_("Users can't find such materials in the listing"), default=False)
+
+    class Meta:
+        ordering = ["position"]
+        indexes = [
+            Index(fields=["module", "position"]),
+        ]
+        verbose_name = pgettext_lazy("lms", "Lesson")
+        verbose_name_plural = pgettext_lazy("lms", "Lessons")
+
+    def __str__(self) -> str:
+        archived = "" if not self.is_archived() else "[archived] "
+
+        if self.material is not None:
+            return f"{archived} {self.material}"
+
+        if self.question is not None:
+            return f"{archived} {self.question.name}"
+
+        if self.call is not None:
+            return f"{archived} {self.call}"
+
+        return "—"
+
+    def get_allowed_comment_count(self, user: User) -> int:
+        count = 0
+        for answer in apps.get_model("homework.Answer").objects.filter(question=self.question_id, author=user).root_only():
+            count += answer.get_limited_comments_for_user_by_crosschecks(user).count()
+
+        return count
+
+    def is_archived(self) -> bool:
+        if self.module.archived is True:
+            return True
+
+        if self.question is not None and self.question.archived is True:  # NOQA: SIM103
+            return True
+
+        return False

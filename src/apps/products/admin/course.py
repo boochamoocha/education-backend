@@ -1,0 +1,114 @@
+from typing import Any
+
+from django.http import HttpRequest
+from django.utils.translation import gettext as _
+from django.utils.translation import pgettext_lazy
+
+from apps.amocrm import tasks
+from apps.products.admin.courses import inlines
+from apps.products.models import Course
+from core.admin import ModelAdmin, admin
+from core.pricing import format_price
+
+
+@admin.register(Course)
+class CourseAdmin(ModelAdmin):
+    fieldsets = [
+        (
+            _("Name"),
+            {
+                "fields": [
+                    "product_name",
+                    "tariff_name",
+                    "slug",
+                    "group",
+                    "purchase_success_url",
+                    "display_in_lms",
+                    "disable_triggers",
+                ],
+            },
+        ),
+        (
+            _("Price"),
+            {
+                "fields": [
+                    "price",
+                    "old_price",
+                ],
+            },
+        ),
+        (
+            _("Dates"),
+            {
+                "fields": [
+                    "start_date",
+                    "end_date",
+                ],
+            },
+        ),
+        (
+            pgettext_lazy("products", "Invoices"),
+            {
+                "fields": [
+                    "name_genitive",
+                    "name_receipt",
+                    "full_name",
+                    "name_international",
+                ],
+            },
+        ),
+        (
+            _("Email messages"),
+            {
+                "fields": [
+                    "welcome_letter_template_id",
+                    "diploma_template_context",
+                ],
+            },
+        ),
+        (
+            _("Order confirmation"),
+            {
+                "fields": [
+                    "confirmation_template_id",
+                    "confirmation_success_url",
+                ],
+            },
+        ),
+    ]
+
+    list_display = (
+        "id",
+        "group",
+        "name",
+        "slug",
+        "formatted_price",
+    )
+
+    list_filter = ("group",)
+
+    list_display_links = (
+        "id",
+        "name",
+    )
+
+    inlines = (
+        inlines.EmailConfigurationAdmin,
+        inlines.DiplomaTemplateAdmin,
+    )
+
+    save_as = True
+    search_fields = [
+        "product_name",
+        "tariff_name",
+    ]
+
+    @admin.display(description=_("Price"), ordering="price")
+    def formatted_price(self, course: Course) -> str:
+        return format_price(course.price)
+
+    def save_model(self, request: HttpRequest, obj: Course, form: Any, change: Any) -> None:
+        super().save_model(request, obj, form, change)
+
+        if tasks.amocrm_enabled():
+            tasks.push_course.apply_async(kwargs={"course_id": obj.pk}, countdown=1)

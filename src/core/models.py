@@ -1,0 +1,98 @@
+import operator
+from collections.abc import Iterable
+from functools import reduce
+from typing import Any
+
+from django.db import models
+from django.db.models.base import ModelBase
+from django.utils import timezone
+
+__all__ = [
+    "DefaultModel",
+    "TimestampedModel",
+    "models",
+]
+
+
+class TestUtilsMixin:
+    def update(self: "models.Model", **kwargs: "Any") -> "models.Model":  # type: ignore[misc]
+        for key, value in kwargs.items():
+            setattr(self, key, value)
+
+        self.save(update_fields=kwargs.keys())
+
+        return self
+
+
+class DefaultModel(TestUtilsMixin, models.Model):
+    class Meta:
+        abstract = True
+
+    def __str__(self) -> str:
+        name = getattr(self, "name", None)
+        if name is not None:
+            return str(name)
+
+        return super().__str__()
+
+
+class TimestampedModel(DefaultModel):
+    """
+    Default app model that has `created` and `updated` attributes.
+    """
+
+    created = models.DateTimeField(auto_now_add=True, db_index=True)
+    modified = models.DateTimeField(null=True, blank=True, db_index=True)
+
+    class Meta:
+        abstract = True
+
+    def save(
+        self,
+        *,
+        force_insert: bool | tuple[ModelBase, ...] = False,
+        force_update: bool = False,
+        using: str | None = None,
+        update_fields: Iterable[str] | None = None,
+    ) -> None:
+        if self.pk:
+            self.modified = timezone.now()
+        super().save(
+            force_insert=force_insert,
+            force_update=force_update,
+            using=using,
+            update_fields=update_fields,
+        )
+
+
+class SubqueryCount(models.Subquery):
+    template = "(SELECT count(id) FROM (%(subquery)s) _count)"
+    output_field = models.IntegerField()
+
+
+class SubquerySum(models.Subquery):
+    template = '(SELECT SUM(_agg."%(column)s") FROM (%(subquery)s) _agg)'
+
+    def __init__(self, queryset: models.QuerySet, column: str, **kwargs: dict) -> None:
+        super().__init__(queryset=queryset, output_field=models.IntegerField(), column=column, **kwargs)
+
+
+def only_one_or_zero_is_set(*fields: str) -> models.Q:
+    """Generate a query for CheckConstraint that allows to set only one (or none of) given fields"""
+    constraints = []
+    for field in fields:
+        constraint = models.Q(
+            **{
+                f"{field}__isnull": False,
+                **{f"{empty_field}__isnull": True for empty_field in fields if empty_field != field},
+            },
+        )
+        constraints.append(constraint)
+
+    all_fields_can_empty_constraint = models.Q(
+        **{f"{field}__isnull": True for field in fields},
+    )
+
+    constraints.append(all_fields_can_empty_constraint)
+
+    return models.Q(reduce(operator.or_, constraints))

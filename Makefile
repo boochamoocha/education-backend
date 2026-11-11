@@ -1,34 +1,58 @@
-install-dev-deps: dev-deps
-	pip-sync requirements.txt dev-requirements.txt
+manage = uv run python src/manage.py
+SIMULTANEOUS_TEST_JOBS=4
 
-install-deps: deps
-	pip-sync requirements.txt
+compilemessages:
+	$(manage) compilemessages
 
-deps:
-	pip install --upgrade pip pip-tools
-	pip-compile requirements.in
+fmt:
+	uv run ruff format src
+	# Run formatter for the second time to fix errors left after first fixing
+	uv run ruff format src
+	uv run ruff check src --fix --unsafe-fixes
+	uv run toml-sort pyproject.toml
 
-dev-deps: deps
-	pip-compile dev-requirements.in
+lint: lint-sources lint-dockerfile lint-yaml
+	uv run toml-sort pyproject.toml --check
+	uv run pymarkdown scan README.md
 
-fetchdb:
-	scp borshev.com:/srv/pmdaily/storage/pmdaily.sqlite storage/
-	cd src && ./manage.py anonymize_db
+lint-sources:
+	uv run ruff format --check src
+	uv run ruff check src
+	uv run mypy src
+	$(manage) makemigrations --check --no-input --dry-run
+	$(manage) check --fail-level WARNING
+	$(manage) spectacular --api-version v1 --fail-on-warn > /dev/null
 
-server:
-	cd src && ./manage.py migrate && ./manage.py runserver
+lint-dockerfile:
+	@if command -v hadolint >/dev/null 2>&1; then \
+		echo Running hadolint...; \
+		hadolint Dockerfile; \
+	else \
+		echo "hadolint not found, skipping Dockerfile linting"; \
+	fi
 
-worker:
-	cd src && celery -A app worker -E --purge
+lint-yaml:
+	@if command -v yamllint >/dev/null 2>&1; then \
+		echo Running yamllint...; \
+		yamllint .; \
+	else \
+		echo "yamllint not found, skipping YAML files linting"; \
+	fi
 
-lint:
-	flake8 src
+
+messages: compilemessages
+	$(manage) makemessages --locale ru
+
+server: compilemessages
+	$(manage) collectstatic --no-input
+
+	$(manage) migrate
+	$(manage) runserver
 
 test:
-	cd src && pytest -n 4 --ff -x && pytest --dead-fixtures
+	cd src && uv run pytest -n ${SIMULTANEOUS_TEST_JOBS} --create-db --cov-report=xml --cov=. --junit-xml=junit-multithread.xml -m 'not single_thread'
+	cd src && uv run pytest --create-db --cov-report=xml --cov=. --cov-append --junit-xml=junit-singlethread.xml -m 'single_thread'
+	cd src && uv run pytest --dead-fixtures
 
-coverage:
-	cd src && pytest --dead-fixtures && pytest --cov-report=xml --cov=. -n4 -x
-
-checkmigrations:
-	cd src && ./manage.py makemigrations --check --no-input --dry-run
+worker:
+	uv run celery --app core --workdir src worker --events --purge

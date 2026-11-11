@@ -1,4 +1,3 @@
-
 # Created by https://www.gitignore.io/api/python
 
 ### Python ###
@@ -47,6 +46,7 @@ nosetests.xml
 coverage.xml
 *,cover
 .hypothesis/
+junit-*.xml
 
 # Translations
 *.mo
@@ -117,6 +117,11 @@ src/frontend/static/js/*
 .idea
 
 .envrc
+*.isorted
 .pytest_cache
 .postgres
 *.sqlite
+
+signature.png
+staticfiles
+requirements.txt

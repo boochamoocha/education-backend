@@ -1,0 +1,9 @@
+#result_list {
+  .field-our_page,
+  .field-notion_page {
+    white-space: nowrap !important;
+  }
+  .field-title {
+    max-width: 10rem;
+  }
+}

@@ -1,56 +1,97 @@
-FROM python:3.9.7-slim-buster
-LABEL maintainer="fedor@borshev.com"
+ARG PYTHON_VERSION=3.14
 
-LABEL com.datadoghq.ad.logs='[{"source": "uwsgi", "service": "django"}]'
-
-ENV PYTHONUNBUFFERED 1
-ENV DEBIAN_FRONTEND noninteractive
-
-ENV STATIC_ROOT /var/lib/django-static
-ENV DATABASE_URL sqlite:////var/lib/django-db/pmdaily.sqlite
-ENV CELERY_BACKEND redis://redis:6379/8
-
-ENV _UWSGI_VERSION 2.0.19.1
-ENV DOCKERIZE_VERSION v0.6.1
-
-EXPOSE 8000
-
-RUN echo deb http://deb.debian.org/debian buster contrib non-free > /etc/apt/sources.list.d/debian-contrib.list \
-  && apt-get update \
-  && apt-get --no-install-recommends install -y gettext locales-all wget imagemagick tzdata git \
-  && rm -rf /var/lib/apt/lists/*
-
-RUN apt-get update && apt-get --no-install-recommends install -y build-essential libxml2-dev libxslt1-dev \
-  && apt-get --no-install-recommends install -y libjpeg62-turbo-dev libjpeg-dev libfreetype6-dev libtiff5-dev liblcms2-dev libwebp-dev tk8.6-dev \
-  && apt-get --no-install-recommends install -y libffi-dev libcgraph6 libgraphviz-dev libmagic-dev \
-  && rm -rf /var/lib/apt/lists/*
-
-RUN wget https://github.com/jwilder/dockerize/releases/download/$DOCKERIZE_VERSION/dockerize-linux-amd64-$DOCKERIZE_VERSION.tar.gz \
-  && tar -C /usr/local/bin -xzvf dockerize-linux-amd64-$DOCKERIZE_VERSION.tar.gz \
-  && rm dockerize-linux-amd64-$DOCKERIZE_VERSION.tar.gz
-
-RUN wget -O uwsgi-${_UWSGI_VERSION}.tar.gz https://github.com/unbit/uwsgi/archive/${_UWSGI_VERSION}.tar.gz \
+#
+# Compile custom uwsgi, cuz debian's one is weird
+#
+FROM python:${PYTHON_VERSION}-slim-bookworm AS uwsgi-compile
+ENV _UWSGI_VERSION=2.0.30
+RUN apt-get update && apt-get --no-install-recommends install -y build-essential wget && rm -rf /var/lib/apt/lists/*
+RUN wget --progress=dot:giga -O uwsgi-${_UWSGI_VERSION}.tar.gz https://github.com/unbit/uwsgi/archive/${_UWSGI_VERSION}.tar.gz \
   && tar zxvf uwsgi-*.tar.gz \
-  && UWSGI_BIN_NAME=/usr/local/bin/uwsgi make -C uwsgi-${_UWSGI_VERSION} \
+  && UWSGI_BIN_NAME=/uwsgi make -C uwsgi-${_UWSGI_VERSION} \
   && rm -Rf uwsgi-*
 
-RUN pip install --no-cache-dir --upgrade pip
 
-COPY dev-requirements.txt requirements.txt /
+#
+# Build poetry and export compiled dependecines as plain requirements.txt
+#
+FROM ghcr.io/astral-sh/uv:0.12.7-alpine AS deps-compile
 
-RUN pip install --no-cache-dir -r requirements.txt -r /dev-requirements.txt
+WORKDIR /
+COPY uv.lock pyproject.toml /
+
+RUN uv export --no-dev -o /requirements.txt
+
+#
+# Base image with django dependecines
+#
+FROM python:${PYTHON_VERSION}-slim-bookworm AS base
+
+ENV PYTHONUTF8=1
+ENV PYTHONUNBUFFERED=1
+ENV DEBIAN_FRONTEND=noninteractive
+
+ENV LANG=C.UTF-8 \
+    LC_ALL=C.UTF-8
+
+ENV STATIC_ROOT=/var/lib/django-static
+ENV CELERY_APP=core.celery
+
+RUN apt-get update \
+  && apt-get --no-install-recommends install -y gettext locales-all tzdata git wait-for-it wget \
+  && rm -rf /var/lib/apt/lists/*
+
+COPY --from=uwsgi-compile /uwsgi /usr/local/bin/
+RUN pip install --no-cache-dir --upgrade pip==25.2
+COPY --from=deps-compile /requirements.txt /
+RUN pip install --no-cache-dir --root-user-action=ignore -r /requirements.txt
+
+# Trust Russian Minсвязи root + sub CAs alongside Debian's bundle.
+# update-ca-certificates appends every *.crt under /usr/local/share/ca-certificates/
+# to /etc/ssl/certs/ca-certificates.crt, then we point certifi at that bundle so
+# httpx/requests honor the additions on top of the Mozilla set.
+COPY .etc/ca-certificates/russian/*.crt /usr/local/share/ca-certificates/russian/
+RUN apt-get update \
+  && apt-get --no-install-recommends install -y ca-certificates \
+  && update-ca-certificates \
+  && ln -sf /etc/ssl/certs/ca-certificates.crt "$(python -c 'import certifi; print(certifi.where())')" \
+  && rm -rf /var/lib/apt/lists/*
 
 WORKDIR /src
 COPY src /src
 
-RUN mkdir /var/lib/django-db
-VOLUME /var/lib/django-db
+ARG RELEASE=unset
+ENV RELEASE=$RELEASE
 
-ENV NO_CACHE=On
-RUN ./manage.py compilemessages
-RUN ./manage.py collectstatic --noinput
-ENV NO_CACHE=Off
+RUN NO_CACHE=On ./manage.py compilemessages \
+  && ./manage.py collectstatic --noinput
 
-HEALTHCHECK CMD wget -q -O /dev/null http://localhost:8000/api/v2/healthchecks/db/ --header "Host: edu-app.borshev.com" || exit 1
+USER nobody
 
-CMD ./manage.py migrate && uwsgi --master --http :8000 --module app.wsgi --workers 2 --threads 2 --harakiri 25 --max-requests 1000 --log-x-forwarded-for
+RUN echo "Built for ${RELEASE}"
+
+#
+# Web worker image
+#
+FROM base AS web
+HEALTHCHECK CMD wget -q -O /dev/null http://localhost:8000/api/v2/healthchecks/db/ --header "Host: app.tough-dev.school" || exit 1
+CMD ["sh", "-c", "./manage.py migrate && uwsgi --master --http :8000 --module core.wsgi --workers 2 --threads 2 --harakiri 25 --max-requests 1000 --buffer-size 8192 --log-x-forwarded-for --logformat '%(addr) - - [%(ltime)] \"%(method) %(uri) %(proto)\" %(status) %(size) \"%(referer)\" \"%(uagent)\"'"]
+
+#
+# Background processing image
+#
+FROM base AS worker
+HEALTHCHECK CMD celery -A ${CELERY_APP} inspect ping -d $QUEUE@$HOSTNAME
+CMD ["sh", "-c", "celery -A ${CELERY_APP} worker -Q $QUEUE -c ${CONCURENCY:-2} -n \"${QUEUE}@%h\" --max-tasks-per-child ${MAX_REQUESTS_PER_CHILD:-50} --time-limit ${TIME_LIMIT:-900} --soft-time-limit ${SOFT_TIME_LIMIT:-45}"]
+
+#
+# Periodic scheduler image
+#
+FROM base AS scheduler
+ENV SCHEDULER_DB_PATH=/var/db/scheduler
+USER root
+RUN mkdir -p ${SCHEDULER_DB_PATH} && chown nobody ${SCHEDULER_DB_PATH}
+VOLUME ${SCHEDULER_DB_PATH}
+USER nobody
+HEALTHCHECK NONE
+CMD ["sh", "-c", "celery -A ${CELERY_APP} beat --pidfile=/tmp/celerybeat.pid --schedule=${SCHEDULER_DB_PATH}/celerybeat-schedule.db"]

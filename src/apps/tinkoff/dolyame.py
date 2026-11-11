@@ -1,0 +1,124 @@
+import ssl
+from decimal import Decimal
+from typing import no_type_check
+from urllib.parse import urljoin
+
+import httpx
+from django.conf import settings
+from django.utils.translation import gettext_lazy as _
+
+from apps.banking.base import Bank
+from apps.banking.models import AcquiringPercent
+
+
+class DolyameRequestException(Exception):
+    pass
+
+
+class Dolyame(Bank):
+    """Dolyame client.
+
+    There is no 'commit' method: it's not required cause 'autocommit' is enabled on the bank side.
+    """
+
+    default_acquiring_percent = Decimal("6.9")
+    default_currency_rate = Decimal(1)
+    base_url = "https://partner.dolyame.ru/v1/"
+    name = _("Dolyame")
+    bank_id = "dolyame"
+
+    def get_initial_payment_url(self) -> str:
+        result = self.post(
+            method="orders/create",
+            payload={
+                "order": {
+                    "id": self.order.slug,
+                    "amount": self.price,
+                    "items": self.get_items(),
+                },
+                "fiscalization_settings": {"type": "enabled"},
+                "client_info": self.get_client_info(),
+                "notification_url": self.get_notification_url(),
+                "success_url": self.success_url,
+                "fail_url": self.fail_url,
+            },
+        )
+
+        return result["link"]
+
+    def refund(self, amount: Decimal | None = None) -> None:
+        """No partial refunds are allowed. Always refund the full amount."""
+        del amount
+
+        self.post(
+            method=f"orders/{self.order.slug}/refund",
+            payload={
+                "amount": self.price,
+                "returned_items": self.get_items(),
+                "fiscalization_settings": {"type": "enabled"},
+            },
+        )
+
+    def post(self, method: str, payload: dict) -> dict:
+        """Query Dolyame API"""
+        ssl_context = ssl.create_default_context()
+        ssl_context.load_cert_chain(certfile=settings.DOLYAME_CERTIFICATE_PATH)
+
+        response = httpx.post(
+            url=urljoin(self.base_url, method),
+            json=payload,
+            auth=(settings.DOLYAME_LOGIN, settings.DOLYAME_PASSWORD),
+            headers={
+                "X-Correlation-ID": self.idempotency_key,
+            },
+            verify=ssl_context,
+        )
+
+        if response.status_code != 200:
+            raise DolyameRequestException(f"Incorrect HTTP-status code for {method}: {response.status_code}")
+
+        return response.json()
+
+    def get_items(self) -> list[dict]:
+        return [
+            {
+                "name": self.order.item.name_receipt,
+                "price": self.price,
+                "quantity": 1,
+                "receipt": {
+                    "payment_method": "full_payment",
+                    "tax": "none",
+                    "payment_object": "service",
+                    "measurement_unit": "шт",
+                },
+            },
+        ]
+
+    def get_client_info(self) -> dict:
+        return {
+            "first_name": self.user.first_name,
+            "last_name": self.user.last_name,
+            "email": self.user.email,
+        }
+
+    @property
+    @no_type_check
+    def price(self) -> str:
+        return str(Decimal(super().price / 100))
+
+    @staticmethod
+    def get_notification_url() -> str:
+        return urljoin(settings.ABSOLUTE_HOST, "/api/v2/banking/dolyame-notifications/")
+
+    def get_acquiring_percent(self) -> Decimal:
+        """Dynamic acquring percent based on order price"""
+        try:
+            big = AcquiringPercent.objects.get(slug="dolyame-big").percent
+            small = AcquiringPercent.objects.get(slug="dolyame-small").percent
+        except AcquiringPercent.DoesNotExist:
+            return super().get_acquiring_percent()
+
+        if self.order.price >= 30_000:
+            return big
+
+        return small
